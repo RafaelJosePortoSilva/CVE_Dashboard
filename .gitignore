@@ -1,2 +1,13 @@
 .env
 .venv/
+
+# Dados baixados/gerados (grandes)
+data/raw/
+data/interim/
+data/processed/
+data/tmp/
+*.duckdb
+*.duckdb.wal
+*.parquet
+__pycache__/
+.ipynb_checkpoints/
