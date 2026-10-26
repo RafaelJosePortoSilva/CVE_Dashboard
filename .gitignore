@@ -11,3 +11,5 @@ data/tmp/
 *.parquet
 __pycache__/
 .ipynb_checkpoints/
+airflow/logs/*
+!airflow/logs/.gitkeep

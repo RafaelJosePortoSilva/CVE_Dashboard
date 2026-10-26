@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -10,7 +11,11 @@ NVD_MAX_WINDOW_DAYS = 120
 
 
 def load_api_key(env_path=".env", variable="NVD_API_KEY"):
-    """Lê a chave da API do NVD de um arquivo .env (sem depender de python-dotenv)."""
+    """Obtém a chave do NVD do ambiente ou de um arquivo .env."""
+    value = os.getenv(variable)
+    if value:
+        return value
+
     path = Path(env_path)
     if not path.exists():
         return None
@@ -79,6 +84,7 @@ def fetch_nvd_pages(
     timeout=60,
     retries=4,
     verbose=True,
+    last_mod_days=None,
 ):
     """
     Baixa todas as páginas da API do NVD no intervalo, salvando um JSON por página.
@@ -88,11 +94,24 @@ def fetch_nvd_pages(
     ``cache_dir/pubStart=AAAA-MM-DD/page_000000.json`` e servem de cache: páginas
     já baixadas não são requisitadas novamente.
 
+    Se ``last_mod_days`` for informado, consulta por data de modificação
+    (``lastModStartDate``/``lastModEndDate``) nos últimos N dias, em vez de data
+    de publicação. É o modo usado nas execuções incrementais diárias.
+
     Returns:
         list[pathlib.Path]: Caminhos das páginas em cache.
     """
-    end = _as_date(end_date, date.today())
-    start = _as_date(start_date, date(1988, 1, 1))
+    if last_mod_days is not None:
+        end = _as_date(end_date, date.today())
+        start = end - timedelta(days=int(last_mod_days))
+        date_field = "lastMod"
+        cache_prefix = "lastMod"
+    else:
+        end = _as_date(end_date, date.today())
+        start = _as_date(start_date, date(1988, 1, 1))
+        date_field = "pub"
+        cache_prefix = "pubStart"
+
     if start > end:
         raise ValueError("start_date deve ser anterior ou igual a end_date")
     if api_key is None:
@@ -102,57 +121,43 @@ def fetch_nvd_pages(
     saved = []
     requests_made = 0
 
-    for window_start, window_end in _iter_windows(start, end):
-        folder = cache / f"pubStart={window_start.isoformat()}"
-        first_page = folder / "page_000000.json"
+    def fetch_page(folder, start_index, window_start, window_end):
+        nonlocal requests_made
+        output = folder / f"page_{start_index:06d}.json"
+        if output.exists() and output.stat().st_size > 0:
+            return json.loads(output.read_text())
 
-        if first_page.exists() and first_page.stat().st_size > 0:
-            payload = json.loads(first_page.read_text())
-            total = payload.get("totalResults", 0)
-        else:
-            if requests_made and pause:
-                time.sleep(pause)
-            payload = _request(
-                {
-                    "resultsPerPage": results_per_page,
-                    "startIndex": 0,
-                    "pubStartDate": f"{window_start.isoformat()}T00:00:00.000",
-                    "pubEndDate": f"{window_end.isoformat()}T23:59:59.999",
-                },
-                api_key,
-                timeout=timeout,
-                retries=retries,
-            )
-            requests_made += 1
-            folder.mkdir(parents=True, exist_ok=True)
-            first_page.write_text(json.dumps(payload))
-            total = payload.get("totalResults", 0)
+        if requests_made and pause:
+            time.sleep(pause)
+        payload = _request(
+            {
+                "resultsPerPage": results_per_page,
+                "startIndex": start_index,
+                f"{date_field}StartDate": f"{window_start.isoformat()}T00:00:00.000",
+                f"{date_field}EndDate": f"{window_end.isoformat()}T23:59:59.999",
+            },
+            api_key,
+            timeout=timeout,
+            retries=retries,
+        )
+        requests_made += 1
+        folder.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload))
+        return payload
+
+    for window_start, window_end in _iter_windows(start, end):
+        folder = cache / f"{cache_prefix}={window_start.isoformat()}"
+        payload = fetch_page(folder, 0, window_start, window_end)
+        total = payload.get("totalResults", 0)
 
         pages = (total + results_per_page - 1) // results_per_page if total else 1
-        saved.append(first_page)
+        saved.append(folder / "page_000000.json")
 
         for page_number in range(1, pages):
             start_index = page_number * results_per_page
             output = folder / f"page_{start_index:06d}.json"
-            if output.exists() and output.stat().st_size > 0:
-                saved.append(output)
-                continue
-
-            if pause:
-                time.sleep(pause)
-            payload = _request(
-                {
-                    "resultsPerPage": results_per_page,
-                    "startIndex": start_index,
-                    "pubStartDate": f"{window_start.isoformat()}T00:00:00.000",
-                    "pubEndDate": f"{window_end.isoformat()}T23:59:59.999",
-                },
-                api_key,
-                timeout=timeout,
-                retries=retries,
-            )
-            requests_made += 1
-            output.write_text(json.dumps(payload))
+            if not (output.exists() and output.stat().st_size > 0):
+                fetch_page(folder, start_index, window_start, window_end)
             saved.append(output)
 
         if verbose:

@@ -59,10 +59,25 @@ def connect(db_path, memory_limit, threads):
     return con
 
 
-def stage_epss(args):
-    log(f"Baixando EPSS de {args.epss_start} até {args.epss_end}")
+def _table_exists(con, name):
+    return bool(
+        con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+            [name],
+        ).fetchone()[0]
+    )
+
+
+def stage_epss(args, con):
+    start = args.epss_start
+    if not _table_exists(con, "epss_history"):
+        # Primeira execução: baixa todo o histórico disponível.
+        start = EPSS_FIRST_DATE.isoformat()
+        log("epss_history ainda não existe; baixando histórico completo do EPSS")
+
+    log(f"Baixando EPSS de {start} até {args.epss_end}")
     files = download_epss_history(
-        start_date=args.epss_start,
+        start_date=start,
         end_date=args.epss_end,
         cache_dir=EPSS_CACHE,
         max_workers=args.workers,
@@ -82,22 +97,35 @@ def _epss_header(path):
     return [column.strip() for column in header.split(",")]
 
 
-def stage_epss_db(con):
+def stage_epss_db(con, rebuild=False):
     files = sorted(EPSS_CACHE.glob("*/*.csv.gz"))
     if not files:
         raise SystemExit("Cache do EPSS vazio; rode a etapa 'epss' primeiro.")
-    log(f"Carregando {len(files)} arquivos do EPSS no DuckDB...")
 
-    con.execute("DROP TABLE IF EXISTS epss_history")
+    if rebuild:
+        con.execute("DROP TABLE IF EXISTS epss_history")
     con.execute(
-        "CREATE TABLE epss_history ("
+        "CREATE TABLE IF NOT EXISTS epss_history ("
         "date DATE, cve VARCHAR, epss DOUBLE, percentile DOUBLE)"
     )
+
+    last_loaded = con.execute("SELECT max(date) FROM epss_history").fetchone()[0]
+    pending = [
+        path for path in files
+        if last_loaded is None
+        or path.name.replace("epss_scores-", "")[:10] > last_loaded.isoformat()
+    ]
+    log(
+        f"EPSS: {len(files)} arquivos em cache, {len(pending)} novo(s) "
+        f"para carregar (última data no banco: {last_loaded})"
+    )
+    if not pending:
+        return
 
     # Insere um arquivo por vez para manter o uso de memória baixo; os arquivos
     # de 2021 (e início de 2022) não têm a coluna percentile.
     con.execute("BEGIN")
-    for index, path in enumerate(files, start=1):
+    for index, path in enumerate(pending, start=1):
         day = path.name.replace("epss_scores-", "")[:10]
         has_percentile = "percentile" in _epss_header(path)
         percentile = (
@@ -112,8 +140,8 @@ def stage_epss_db(con):
             FROM read_csv('{path.as_posix()}', header = true, comment = '#')
             """
         )
-        if index % 100 == 0 or index == len(files):
-            log(f"  {index}/{len(files)} arquivos")
+        if index % 100 == 0 or index == len(pending):
+            log(f"  {index}/{len(pending)} arquivos")
     con.execute("COMMIT")
 
     rows = con.execute("SELECT count(*) FROM epss_history").fetchone()[0]
@@ -121,20 +149,43 @@ def stage_epss_db(con):
     log(f"epss_history: {rows:,} linhas ({dates[0]} a {dates[1]})")
 
 
-def stage_nvd(args):
-    log(f"Baixando NVD de {args.nvd_start} até {args.nvd_end}")
-    files = fetch_nvd_pages(
-        start_date=args.nvd_start,
-        end_date=args.nvd_end,
-        cache_dir=NVD_CACHE,
-        pause=args.nvd_pause,
-        verbose=True,
+def stage_nvd(args, con):
+    has_nvd_data = (
+        _table_exists(con, "nvd_cves")
+        and con.execute("SELECT count(*) FROM nvd_cves").fetchone()[0] > 100_000
     )
+    has_full_cache = any(NVD_CACHE.glob("pubStart=*"))
+
+    if args.nvd_mode == "incremental" and has_nvd_data and has_full_cache:
+        log(
+            f"Baixando NVD modificado nos últimos {args.nvd_lookback_days} dia(s)"
+        )
+        files = fetch_nvd_pages(
+            cache_dir=NVD_CACHE,
+            pause=args.nvd_pause,
+            verbose=True,
+            last_mod_days=args.nvd_lookback_days,
+        )
+    else:
+        if args.nvd_mode == "incremental":
+            log("NVD completo ainda não carregado; baixando histórico completo")
+        else:
+            log(f"Baixando NVD completo de {args.nvd_start} até {args.nvd_end}")
+        files = fetch_nvd_pages(
+            start_date=args.nvd_start,
+            end_date=args.nvd_end,
+            cache_dir=NVD_CACHE,
+            pause=args.nvd_pause,
+            verbose=True,
+        )
     log(f"NVD: {len(files)} páginas em cache em {NVD_CACHE}")
 
 
 def stage_nvd_db(con):
-    pages = sorted(NVD_CACHE.glob("pubStart=*/page_*.json"))
+    pages = sorted(
+        set(NVD_CACHE.glob("pubStart=*/page_*.json"))
+        | set(NVD_CACHE.glob("lastMod=*/page_*.json"))
+    )
     if not pages:
         raise SystemExit("Cache do NVD vazio; rode a etapa 'nvd' primeiro.")
     log(f"Carregando {len(pages)} páginas do NVD no DuckDB...")
@@ -318,6 +369,23 @@ def main():
     parser.add_argument("--epss-end", default=date.today().isoformat())
     parser.add_argument("--nvd-start", default="1988-01-01")
     parser.add_argument("--nvd-end", default=date.today().isoformat())
+    parser.add_argument(
+        "--nvd-mode",
+        choices=("full", "incremental"),
+        default="full",
+        help="full: baixa todo o NVD; incremental: só o que mudou (padrão: full)",
+    )
+    parser.add_argument(
+        "--nvd-lookback-days",
+        type=int,
+        default=3,
+        help="Dias de lookback no modo incremental (padrão: 3)",
+    )
+    parser.add_argument(
+        "--epss-rebuild",
+        action="store_true",
+        help="Recria a tabela epss_history do zero",
+    )
     parser.add_argument("--workers", type=int, default=12,
                         help="Downloads paralelos do EPSS (padrão: 12)")
     parser.add_argument("--nvd-pause", type=float, default=0.7,
@@ -337,11 +405,11 @@ def main():
     con = connect(args.db, args.memory_limit, args.threads)
     try:
         if "epss" in stages:
-            stage_epss(args)
+            stage_epss(args, con)
         if "epss-db" in stages:
-            stage_epss_db(con)
+            stage_epss_db(con, rebuild=args.epss_rebuild)
         if "nvd" in stages:
-            stage_nvd(args)
+            stage_nvd(args, con)
         if "nvd-db" in stages:
             stage_nvd_db(con)
         if "join" in stages:
