@@ -38,8 +38,15 @@ docker compose up -d
 docker compose ps
 ```
 
-Interface: <http://localhost:8080> — usuário/senha padrão `airflow` / `airflow`
-(configuráveis em `airflow/.env`).
+Interface do Airflow: <http://localhost:8080> — usuário/senha padrão `airflow` /
+`airflow` (configuráveis em `airflow/.env`).
+
+Para subir também o dashboard Streamlit:
+
+```bash
+docker compose --profile dashboard up -d
+# http://localhost:8501
+```
 
 O `AIRFLOW_UID` precisa ser o dono dos arquivos do projeto, senão as tarefas não
 conseguem escrever em `data/`. No Linux:
@@ -64,7 +71,9 @@ Ou deixe a `cve_daily` fazer o bootstrap sozinha na primeira execução (leva
 
 ```bash
 docker compose logs -f airflow-scheduler
-docker compose exec airflow-scheduler airflow dags list-runs -d cve_daily
+docker compose exec airflow-scheduler airflow dags list-runs cve_daily
+docker compose exec airflow-scheduler airflow tasks states-for-dag-run \
+    cve_daily "<run_id>"
 ```
 
 ## Chave da API do NVD
@@ -118,6 +127,7 @@ airflow/
 ├── Dockerfile            # imagem do Airflow + dependências do pipeline
 ├── requirements.txt      # duckdb, pandas, requests
 ├── docker-compose.yaml   # Postgres + apiserver + scheduler + dag-processor
+│                         # + dashboard (profile "dashboard")
 ├── .env.example          # AIRFLOW_UID, FERNET_KEY, credenciais
 ├── dags/
 │   └── cve_pipeline.py   # cve_daily e cve_full_refresh
