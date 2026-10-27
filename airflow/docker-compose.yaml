@@ -161,5 +161,22 @@ services:
       - -c
       - airflow
 
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    image: cve-dashboard:latest
+    profiles:
+      - dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../data:/app/data:ro
+      - ../dashboard/app.py:/app/app.py:ro
+    environment:
+      CVE_DB_PATH: /app/data/processed/cves.duckdb
+      CVE_APACHE_CSV: /app/data/processed/apache_cves_enriched.csv
+    restart: unless-stopped
+
 volumes:
   postgres-db-volume:
